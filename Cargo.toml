@@ -1,0 +1,10 @@
+[package]
+name = "codexion_live"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.37.0", features = ["full"] }
+tokio-tungstenite = "0.21.0"
+futures-util = "0.3.30"
+tokio-stream = { version = "0.1.15", features = ["io-util"] }

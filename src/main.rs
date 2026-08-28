@@ -5,9 +5,26 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, RwLock};
 use tokio_tungstenite::tungstenite::Message;
 use futures_util::{SinkExt, StreamExt};
+use std::io::IsTerminal;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<String> = env::args().collect();
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        println!("Usage: ./codexion ARGS | ./codexion_live\n");
+        println!("codexion_live is a bridge to a web visualizer.");
+        println!("It reads data from standard input (stdin) and broadcasts it to connected WebSocket clients.\n");
+        println!("Options:");
+        println!("  -h, --help    Show this help message");
+        return Ok(());
+    }
+
+    if std::io::stdin().is_terminal() {
+        eprintln!("⚠️ WARNING: codexion_live is designed to be used with a pipe.");
+        eprintln!("Expected usage: ./codexion ARGS | ./codexion_live");
+        eprintln!("It is currently waiting for manual input from the terminal.\n");
+    }
+
     let port = env::var("PORT").unwrap_or_else(|_| "8080".to_string());
     let addr = format!("127.0.0.1:{}", port);
     

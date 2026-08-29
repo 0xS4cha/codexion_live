@@ -1,100 +1,128 @@
-use std::env;
+use anyhow::Result;
+use clap::Parser;
+use futures_util::{SinkExt, StreamExt};
+use std::collections::VecDeque;
+use std::io::IsTerminal;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, RwLock};
 use tokio_tungstenite::tungstenite::Message;
-use futures_util::{SinkExt, StreamExt};
-use std::io::IsTerminal;
+use tracing::{error, info, warn};
+
+#[derive(Parser)]
+#[command(name = "codexion_live")]
+#[command(about = "A bridge reading stdin and broadcasting to WebSockets")]
+struct Cli {
+    #[arg(short, long, default_value = "8080")]
+    port: u16,
+
+    #[arg(long, default_value = "127.0.0.1")]
+    host: String,
+
+    #[arg(short, long, default_value = "10000")]
+    max_history: usize,
+}
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = env::args().collect();
-    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
-        println!("Usage: ./codexion ARGS | ./codexion_live\n");
-        println!("codexion_live is a bridge to a web visualizer.");
-        println!("It reads data from standard input (stdin) and broadcasts it to connected WebSocket clients.\n");
-        println!("Options:");
-        println!("  -h, --help    Show this help message");
-        return Ok(());
-    }
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt::init();
+
+    let cli = Cli::parse();
 
     if std::io::stdin().is_terminal() {
-        eprintln!("⚠️ WARNING: codexion_live is designed to be used with a pipe.");
-        eprintln!("Expected usage: ./codexion ARGS | ./codexion_live");
-        eprintln!("It is currently waiting for manual input from the terminal.\n");
+        warn!("codexion_live is designed to be used with a pipe. It is waiting for manual input.");
     }
 
-    let port = env::var("PORT").unwrap_or_else(|_| "8080".to_string());
-    let addr = format!("127.0.0.1:{}", port);
-    
+    let addr = format!("{}:{}", cli.host, cli.port);
     let (tx, _rx) = broadcast::channel::<String>(1000);
     let tx_shared = Arc::new(tx);
-
-    let history = Arc::new(RwLock::new(Vec::new()));
+    let history = Arc::new(RwLock::new(VecDeque::with_capacity(cli.max_history)));
 
     let listener = TcpListener::bind(&addr).await?;
-    println!("Codexion Live Bridge started.");
-    println!("WebSocket server listening on ws://{}", addr);
-    println!("Reading from stdin...");
+    info!("Codexion Live Bridge started.");
+    info!("WebSocket server listening on ws://{}", addr);
 
     let tx_clone = tx_shared.clone();
     let history_clone = history.clone();
-    
-    tokio::spawn(async move {
+    let max_hist = cli.max_history;
+
+    let stdin_task = tokio::spawn(async move {
         let stdin = tokio::io::stdin();
         let mut reader = BufReader::new(stdin).lines();
-        
+
         while let Ok(Some(line)) = reader.next_line().await {
-            println!("{}", line);
+            info!("{}", line);
             
-            history_clone.write().await.push(line.clone());
+            let mut hist = history_clone.write().await;
+            if hist.len() >= max_hist {
+                hist.pop_front();
+            }
+            hist.push_back(line.clone());
             
             let _ = tx_clone.send(line);
         }
-        
-        println!("End of stdin stream.");
+        info!("End of stdin stream.");
     });
 
-    while let Ok((stream, _)) = listener.accept().await {
-        let tx_conn = tx_shared.clone();
-        let history_conn = history.clone();
-        tokio::spawn(handle_connection(stream, tx_conn, history_conn));
+    loop {
+        tokio::select! {
+            result = listener.accept() => {
+                match result {
+                    Ok((stream, _)) => {
+                        let tx_conn = tx_shared.clone();
+                        let history_conn = history.clone();
+                        tokio::spawn(handle_connection(stream, tx_conn, history_conn));
+                    }
+                    Err(e) => {
+                        error!("Error accepting connection: {}", e);
+                    }
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                info!("Received SIGINT, shutting down...");
+                break;
+            }
+        }
     }
 
+    stdin_task.abort();
     Ok(())
 }
 
-async fn handle_connection(stream: TcpStream, tx: Arc<broadcast::Sender<String>>, history: Arc<RwLock<Vec<String>>>) {
+async fn handle_connection(
+    stream: TcpStream,
+    tx: Arc<broadcast::Sender<String>>,
+    history: Arc<RwLock<VecDeque<String>>>,
+) {
     let ws_stream = match tokio_tungstenite::accept_async(stream).await {
         Ok(ws) => ws,
         Err(e) => {
-            eprintln!("Error during the websocket handshake: {}", e);
+            error!("WebSocket handshake failed: {}", e);
             return;
         }
     };
 
-    println!("New WebSocket connection established.");
+    info!("New WebSocket connection established.");
     let (mut sender, mut _receiver) = ws_stream.split();
-    
     let mut rx = tx.subscribe();
 
     let hist = history.read().await;
     if !hist.is_empty() {
-        let bulk_message = hist.join("\n");
-        if sender.send(Message::Text(bulk_message)).await.is_err() {
-            println!("Failed to send history, client disconnected.");
+        let bulk = hist.iter().cloned().collect::<Vec<_>>().join("\n");
+        if let Err(e) = sender.send(Message::Text(bulk)).await {
+            error!("Failed to send history, client disconnected: {}", e);
             return;
         }
     }
-    drop(hist); 
+    drop(hist);
 
     tokio::spawn(async move {
         while let Ok(msg) = rx.recv().await {
-            if sender.send(Message::Text(msg)).await.is_err() {
+            if let Err(_) = sender.send(Message::Text(msg)).await {
                 break;
             }
         }
-        println!("WebSocket connection closed.");
+        info!("WebSocket connection closed.");
     });
 }

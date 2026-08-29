@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
+use serde::Deserialize;
 use std::collections::VecDeque;
 use std::io::IsTerminal;
 use std::sync::Arc;
@@ -24,11 +25,41 @@ struct Cli {
     max_history: usize,
 }
 
+#[derive(Deserialize)]
+struct GithubRelease {
+    tag_name: String,
+    html_url: String,
+}
+
+async fn check_for_updates() {
+    let client = reqwest::Client::new();
+    let res = client
+        .get("https://api.github.com/repos/0xS4cha/codexion_live/releases/latest")
+        .header("User-Agent", "codexion_live")
+        .send()
+        .await;
+
+    if let Ok(response) = res {
+        if let Ok(release) = response.json::<GithubRelease>().await {
+            let current_version = env!("CARGO_PKG_VERSION");
+            let remote_version = release.tag_name.trim_start_matches('v');
+            if remote_version != current_version {
+                warn!(
+                    "A new version of codexion_live is available: v{} (current: v{}). Download it here: {}",
+                    remote_version, current_version, release.html_url
+                );
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     let cli = Cli::parse();
+
+    tokio::spawn(check_for_updates());
 
     if std::io::stdin().is_terminal() {
         warn!("codexion_live is designed to be used with a pipe. It is waiting for manual input.");
